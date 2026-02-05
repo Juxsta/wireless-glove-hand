@@ -1,0 +1,18 @@
+# Build outputs
+build/
+.pio/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+*.code-workspace
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.env
+secrets/
