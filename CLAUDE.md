@@ -52,7 +52,7 @@ Load agents for specialized guidance:
 - **Antonio** — Robotic hand hardware/3D printing
 - **Raul** — Control glove hardware
 - **Matthew** — Wireless code/protocol
-- **Eric (@juxsta)** — Project planning, ideation, integration
+- **Eric (@juxsta)** — 3D printing, CAD, coding, project planning
 - **Group** — FOC implementation, integration testing
 
 ## Quick Reference

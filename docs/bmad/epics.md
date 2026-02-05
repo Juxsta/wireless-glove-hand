@@ -11,7 +11,7 @@ This document provides the complete epic and story breakdown for the Wireless Gl
 | Antonio Rojas | Robotic hand hardware / 3D printing | — |
 | Raul Hernandez-Solis | Control glove hardware | — |
 | Matthew Men | Wireless code / protocol | — |
-| Eric Reyes | Project planning / ideation / integration | @juxsta |
+| Eric Reyes (011351067) | 3D printing / CAD / coding / project planning | @juxsta |
 
 ## Requirements Inventory
 
