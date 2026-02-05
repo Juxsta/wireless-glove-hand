@@ -4,10 +4,10 @@
 
 ## Team
 
-- Antonio Rojas (014974063)
-- Raul Hernandez-Solis (016319693)
-- Matthew Men (016601806)
-- Eric Reyes
+- Antonio Rojas (014974063) — Robotic hand hardware / 3D printing
+- Raul Hernandez-Solis (016319693) — Control glove hardware
+- Matthew Men (016601806) — Wireless code / protocol
+- Eric Reyes (@juxsta) — Project planning / ideation / integration
 
 **Advisor:** Junaid Anwar
 

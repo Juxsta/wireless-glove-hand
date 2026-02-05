@@ -4,6 +4,15 @@
 
 This document provides the complete epic and story breakdown for the Wireless Glove Interface for Real-Time Robotic Hand Mimicry project, decomposing the requirements from the senior project proposal into implementable stories.
 
+## Team
+
+| Member | Role | GitHub |
+|--------|------|--------|
+| Antonio Rojas | Robotic hand hardware / 3D printing | — |
+| Raul Hernandez-Solis | Control glove hardware | — |
+| Matthew Men | Wireless code / protocol | — |
+| Eric Reyes | Project planning / ideation / integration | @juxsta |
+
 ## Requirements Inventory
 
 ### Functional Requirements
