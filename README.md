@@ -25,13 +25,13 @@ The goal is to demonstrate that joint-level robotic hand control can be achieved
 
 ```
 ┌─────────────────────┐        BLE         ┌──────────────────────┐
-│    Control Glove     │  ──────────────▶  │     Robotic Hand      │
-│                      │    ~30 Hz data     │                      │
-│  • Flex sensors (4/  │                    │  • BLDC motors (FOC)  │
-│    finger joint)     │                    │  • DRV8302 drivers    │
-│  • ESP32 (ADC + BLE) │                    │  • AS5600 encoders    │
-│  • Calibration       │                    │  • ESP32 (control)    │
-│    routines          │                    │  • 2S LiPo battery    │
+│    Control Glove     │  ──────────────▶  │     Robotic Hand     │
+│                      │    ~30 Hz data    │                      │
+│  • Flex sensors (4/  │                   │  • BLDC motors (FOC) │
+│    finger joint)     │                   │  • DRV8302 drivers   │
+│  • ESP32 (ADC + BLE) │                   │  • AS5600 encoders   │
+│  • Calibration       │                   │  • ESP32 (control)   │
+│    routines          │                   │  • 2S LiPo battery   │
 └─────────────────────┘                    └──────────────────────┘
 ```
 
