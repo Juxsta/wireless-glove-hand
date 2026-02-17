@@ -102,10 +102,11 @@ wireless-glove-hand/
 | Phase | Dates | Deliverables |
 |-------|-------|--------------|
 | Research & Proposal | Aug – Dec 2025 | Literature review, EE198A proposal, oral presentation |
-| Firmware Prototyping & FOC | Jan 1 – Feb 3, 2026 | Sensor reading, BLE pairing, basic FOC |
-| Motor & Mechanical Integration | Feb 4 – Mar 18, 2026 | 3D-printed hand, motor mounting, driver wiring |
-| System Integration & Testing | Mar 19 – Apr 30, 2026 | End-to-end testing, latency measurement, accuracy validation |
-| Final Report & Presentation | May 1 – 15, 2026 | EE198B written report, oral presentation, demo |
+| Design & Component Selection | Jan – Feb 2026 | Schematic design, BOM finalization, FOC algorithm research |
+| Firmware Development | Feb – Mar 2026 | Sensor reading, BLE communication, FOC motor control |
+| Mechanical Build & Integration | Mar – Apr 2026 | 3D-printed hand, motor mounting, wiring, system integration |
+| Testing & Validation | Apr – May 2026 | Latency measurement, accuracy validation, endurance testing |
+| Final Report & Presentation | May 2026 | EE198B written report, oral presentation, live demo |
 
 ## Getting Started
 
