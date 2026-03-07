@@ -2,7 +2,8 @@
  * MLX90395 Hall-Effect Magnetic Sensor Driver
  * 
  * 3-axis magnetometer via SPI for finger joint angle tracking.
- * Based on Antonio's implementation (EE198B Midterm Report).
+ * Original implementation by Antonio Rojas (EE198B).
+ * Extracted into reusable driver by Eric Reyes.
  * 
  * Usage:
  *   MLX90395 sensor(CS_PIN);

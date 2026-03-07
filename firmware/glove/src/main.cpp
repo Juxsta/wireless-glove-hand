@@ -10,8 +10,9 @@
  * - SPI bus: SCK=18, MISO=19, MOSI=23
  * - Chip selects: CS0=5, CS1=17, CS2=16
  * 
- * Based on Antonio's implementation (EE198B Midterm Report)
- * Cleaned up by Eric for production firmware
+ * Original sensor reading and ESP-NOW implementation by Antonio Rojas
+ * Wireless communication testing by Matthew Men
+ * Refactored by Eric Reyes
  */
 
 #include <Arduino.h>

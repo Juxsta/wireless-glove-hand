@@ -11,7 +11,9 @@
  * 
  * Protocol: ESP-NOW (from glove controller)
  * 
- * Updated by Eric to reflect actual build (2204 motors, DRV8300 PCB, ESP-NOW)
+ * Motor driver PCB designed by Raul Hernandez-Solis (DRV8300 + ACS37042)
+ * Motors sourced and tested by Matthew Men
+ * FOC integration and firmware by Eric Reyes
  */
 
 #include <Arduino.h>
