@@ -1,130 +1,244 @@
 /**
  * Wireless Glove Interface - Glove Firmware (Transmitter)
  * 
- * Reads flex sensors and transmits joint angles via BLE.
+ * Reads MLX90395 Hall-effect magnetic sensors via SPI and transmits
+ * joint angles via ESP-NOW to robotic hand.
  * 
  * Hardware:
  * - ESP32 DevKit v1
- * - 2x Flex sensors on GPIO 34, 35
+ * - 3x MLX90395 sensors (MCP, PIP, DIP joints)
+ * - SPI bus: SCK=18, MISO=19, MOSI=23
+ * - Chip selects: CS0=5, CS1=17, CS2=16
  * 
- * BLE Service: 4fafc201-1fb5-459e-8fcc-c5c9c331914b
- * BLE Characteristic: beb5483e-36e1-4688-b7f5-ea07361b26a8
+ * Based on Antonio's implementation (EE198B Midterm Report)
+ * Cleaned up by Eric for production firmware
  */
 
 #include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Preferences.h>
+#include "mlx90395.h"
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+// Receiver MAC address (hand controller ESP32)
+// TODO: Replace with actual MAC address of hand controller
+// Run WiFi.macAddress() on hand controller to get its MAC
+#define RECEIVER_MAC {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 
-// Flex sensor pins (ADC1 channels - safe with BLE)
-#define FLEX_MCP_PIN 34
-#define FLEX_PIP_PIN 35
+// MLX90395 chip select pins
+#define CS_MCP  5   // Metacarpophalangeal (knuckle)
+#define CS_PIP  17  // Proximal interphalangeal
+#define CS_DIP  16  // Distal interphalangeal
 
 // Transmission rate
-#define TX_INTERVAL_MS 33  // ~30 Hz
+#define TX_INTERVAL_MS 20  // ~50 Hz
+
+// Calibration button (optional)
+#define CALIB_BUTTON_PIN 0  // BOOT button on DevKit
 
 // =============================================================================
-// Calibration Data (stored in flash)
+// Global Objects
 // =============================================================================
 
-struct CalibrationData {
-    uint16_t mcp_min = 1000;
-    uint16_t mcp_max = 3000;
-    uint16_t pip_min = 1000;
-    uint16_t pip_max = 3000;
-};
+MLX90395 sensorMCP(CS_MCP);
+MLX90395 sensorPIP(CS_PIP);
+MLX90395 sensorDIP(CS_DIP);
 
-CalibrationData cal;
+Preferences prefs;
 
-// =============================================================================
-// BLE State
-// =============================================================================
+// Peer info for ESP-NOW
+uint8_t receiverAddress[] = RECEIVER_MAC;
+esp_now_peer_info_t peerInfo;
 
-BLEServer* pServer = nullptr;
-BLECharacteristic* pCharacteristic = nullptr;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+// Packet state
 uint8_t sequenceNumber = 0;
+bool espnowReady = false;
 
 // =============================================================================
-// BLE Callbacks
+// ESP-NOW Packet Structure (10 bytes)
 // =============================================================================
 
-class ServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-        deviceConnected = true;
-        Serial.println("Client connected");
-    }
-
-    void onDisconnect(BLEServer* pServer) {
-        deviceConnected = false;
-        Serial.println("Client disconnected");
-    }
+struct __attribute__((packed)) GlovePacket {
+    uint8_t sequence;      // Sequence number (0-255, wraps)
+    int16_t mcp_angle;     // MCP angle in degrees * 10 (e.g., 450 = 45.0°)
+    int16_t pip_angle;     // PIP angle in degrees * 10
+    int16_t dip_angle;     // DIP angle in degrees * 10
+    uint8_t reserved;      // Future: TIP angle or status flags
+    uint8_t checksum;      // XOR of all previous bytes
 };
+
+// =============================================================================
+// ESP-NOW Callbacks
+// =============================================================================
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    // Optional: Track send failures for debugging
+    if (status != ESP_NOW_SEND_SUCCESS) {
+        static int failCount = 0;
+        if (++failCount % 100 == 0) {
+            Serial.printf("ESP-NOW: %d send failures\n", failCount);
+        }
+    }
+}
 
 // =============================================================================
 // Sensor Functions
 // =============================================================================
 
-uint8_t readFlexAngle(int pin, uint16_t minVal, uint16_t maxVal) {
-    uint16_t raw = analogRead(pin);
+void initSensors() {
+    Serial.println("Initializing MLX90395 sensors...");
     
-    // Constrain to calibration range
-    raw = constrain(raw, minVal, maxVal);
+    sensorMCP.init();
+    sensorPIP.init();
+    sensorDIP.init();
     
-    // Map to 0-180 degrees, then to 0-255 for transmission
-    float angle = map(raw, minVal, maxVal, 0, 180);
-    return (uint8_t)((angle / 180.0f) * 255.0f);
+    delay(50);
+    
+    // Start burst mode on all sensors
+    sensorMCP.startBurst();
+    sensorPIP.startBurst();
+    sensorDIP.startBurst();
+    
+    Serial.println("Sensors initialized and in burst mode");
 }
 
-void calibrateSensors() {
-    Serial.println("=== CALIBRATION MODE ===");
-    Serial.println("Hold hand FLAT and press any key...");
+void loadCalibration() {
+    prefs.begin("glove-cal", true);  // Read-only
+    
+    // Load MCP calibration
+    if (prefs.isKey("mcp_x")) {
+        int16_t x = prefs.getShort("mcp_x", 0);
+        int16_t y = prefs.getShort("mcp_y", 0);
+        int16_t z = prefs.getShort("mcp_z", 0);
+        sensorMCP.setCalibration(x, y, z);
+        Serial.printf("Loaded MCP calibration: X=%d, Y=%d, Z=%d\n", x, y, z);
+    }
+    
+    // Load PIP calibration
+    if (prefs.isKey("pip_x")) {
+        int16_t x = prefs.getShort("pip_x", 0);
+        int16_t y = prefs.getShort("pip_y", 0);
+        int16_t z = prefs.getShort("pip_z", 0);
+        sensorPIP.setCalibration(x, y, z);
+        Serial.printf("Loaded PIP calibration: X=%d, Y=%d, Z=%d\n", x, y, z);
+    }
+    
+    // Load DIP calibration
+    if (prefs.isKey("dip_x")) {
+        int16_t x = prefs.getShort("dip_x", 0);
+        int16_t y = prefs.getShort("dip_y", 0);
+        int16_t z = prefs.getShort("dip_z", 0);
+        sensorDIP.setCalibration(x, y, z);
+        Serial.printf("Loaded DIP calibration: X=%d, Y=%d, Z=%d\n", x, y, z);
+    }
+    
+    prefs.end();
+}
+
+void saveCalibration() {
+    prefs.begin("glove-cal", false);  // Read-write
+    
+    // Save MCP
+    MagCalibration cal = sensorMCP.getCalibration();
+    prefs.putShort("mcp_x", cal.x_offset);
+    prefs.putShort("mcp_y", cal.y_offset);
+    prefs.putShort("mcp_z", cal.z_offset);
+    
+    // Save PIP
+    cal = sensorPIP.getCalibration();
+    prefs.putShort("pip_x", cal.x_offset);
+    prefs.putShort("pip_y", cal.y_offset);
+    prefs.putShort("pip_z", cal.z_offset);
+    
+    // Save DIP
+    cal = sensorDIP.getCalibration();
+    prefs.putShort("dip_x", cal.x_offset);
+    prefs.putShort("dip_y", cal.y_offset);
+    prefs.putShort("dip_z", cal.z_offset);
+    
+    prefs.end();
+    Serial.println("Calibration saved to flash");
+}
+
+void runCalibration() {
+    Serial.println("\n=== CALIBRATION MODE ===");
+    Serial.println("Hold hand FLAT and press ENTER...");
     while (!Serial.available()) delay(100);
-    Serial.read();
+    while (Serial.available()) Serial.read();  // Clear buffer
     
-    cal.mcp_min = analogRead(FLEX_MCP_PIN);
-    cal.pip_min = analogRead(FLEX_PIP_PIN);
-    Serial.printf("Flat: MCP=%d, PIP=%d\n", cal.mcp_min, cal.pip_min);
+    // Calibrate all sensors (20 samples each)
+    sensorMCP.calibrate(20);
+    sensorPIP.calibrate(20);
+    sensorDIP.calibrate(20);
     
-    Serial.println("Make a FIST and press any key...");
-    while (!Serial.available()) delay(100);
-    Serial.read();
+    // Save to flash
+    saveCalibration();
     
-    cal.mcp_max = analogRead(FLEX_MCP_PIN);
-    cal.pip_max = analogRead(FLEX_PIP_PIN);
-    Serial.printf("Fist: MCP=%d, PIP=%d\n", cal.mcp_max, cal.pip_max);
-    
-    Serial.println("Calibration complete!");
-    // TODO: Save to EEPROM/Preferences
+    Serial.println("=== CALIBRATION COMPLETE ===\n");
 }
 
 // =============================================================================
-// Packet Building
+// ESP-NOW Functions
 // =============================================================================
 
-void buildPacket(uint8_t* packet) {
-    uint8_t mcp = readFlexAngle(FLEX_MCP_PIN, cal.mcp_min, cal.mcp_max);
-    uint8_t pip = readFlexAngle(FLEX_PIP_PIN, cal.pip_min, cal.pip_max);
+void initESPNow() {
+    // Set device as a WiFi Station
+    WiFi.mode(WIFI_STA);
     
-    // Derive DIP and TIP from PIP (coupled motion for PoC)
-    uint8_t dip = pip;  // Same as PIP
-    uint8_t tip = pip;  // Same as PIP
+    Serial.print("MAC Address: ");
+    Serial.println(WiFi.macAddress());
     
-    packet[0] = sequenceNumber++;
-    packet[1] = mcp;
-    packet[2] = pip;
-    packet[3] = dip;
-    packet[4] = tip;
-    packet[5] = packet[0] ^ packet[1] ^ packet[2] ^ packet[3] ^ packet[4];  // Checksum
+    // Init ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+    
+    // Register send callback
+    esp_now_register_send_cb(onDataSent);
+    
+    // Register peer (hand controller)
+    memcpy(peerInfo.peer_addr, receiverAddress, 6);
+    peerInfo.channel = 0;  // Use current WiFi channel
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add peer");
+        return;
+    }
+    
+    espnowReady = true;
+    Serial.println("ESP-NOW initialized");
+}
+
+void sendPacket(float mcp_deg, float pip_deg, float dip_deg) {
+    if (!espnowReady) return;
+    
+    GlovePacket packet;
+    packet.sequence = sequenceNumber++;
+    packet.mcp_angle = (int16_t)(mcp_deg * 10.0f);  // Store as degrees * 10
+    packet.pip_angle = (int16_t)(pip_deg * 10.0f);
+    packet.dip_angle = (int16_t)(dip_deg * 10.0f);
+    packet.reserved = 0;
+    
+    // Calculate checksum (XOR of all bytes except checksum itself)
+    uint8_t* data = (uint8_t*)&packet;
+    uint8_t checksum = 0;
+    for (int i = 0; i < sizeof(GlovePacket) - 1; i++) {
+        checksum ^= data[i];
+    }
+    packet.checksum = checksum;
+    
+    // Send via ESP-NOW
+    esp_err_t result = esp_now_send(receiverAddress, (uint8_t*)&packet, sizeof(packet));
+    
+    if (result != ESP_OK) {
+        Serial.println("Error sending packet");
+    }
 }
 
 // =============================================================================
@@ -133,36 +247,27 @@ void buildPacket(uint8_t* packet) {
 
 void setup() {
     Serial.begin(115200);
+    delay(1000);  // Allow serial to initialize
+    
     Serial.println("\n=== Wireless Glove - Transmitter ===");
+    Serial.println("Based on MLX90395 Hall-effect sensors + ESP-NOW");
+    Serial.println("EE198B Senior Project - SJSU 2026\n");
     
-    // Initialize ADC
-    analogReadResolution(12);
-    analogSetAttenuation(ADC_11db);  // Full 0-3.3V range
+    // Initialize calibration button
+    pinMode(CALIB_BUTTON_PIN, INPUT_PULLUP);
     
-    // Initialize BLE
-    BLEDevice::init("GloveController");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new ServerCallbacks());
+    // Initialize sensors
+    initSensors();
     
-    BLEService* pService = pServer->createService(SERVICE_UUID);
-    pCharacteristic = pService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_READ |
-        BLECharacteristic::PROPERTY_NOTIFY
-    );
-    pCharacteristic->addDescriptor(new BLE2902());
+    // Load calibration from flash (if available)
+    loadCalibration();
     
-    pService->start();
+    // Initialize ESP-NOW
+    initESPNow();
     
-    // Start advertising
-    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);  // For iPhone compatibility
-    BLEDevice::startAdvertising();
-    
-    Serial.println("BLE advertising started. Waiting for connection...");
-    Serial.println("Press 'c' for calibration mode");
+    Serial.println("\n=== Ready to transmit ===");
+    Serial.println("Press 'c' in serial monitor for calibration mode");
+    Serial.println("Press BOOT button for quick calibration\n");
 }
 
 // =============================================================================
@@ -171,43 +276,50 @@ void setup() {
 
 void loop() {
     static unsigned long lastTx = 0;
+    static int debugCounter = 0;
     
-    // Check for calibration command
+    // Check for calibration trigger (serial or button)
     if (Serial.available()) {
         char c = Serial.read();
         if (c == 'c' || c == 'C') {
-            calibrateSensors();
+            runCalibration();
         }
     }
     
-    // Transmit at fixed rate
-    if (deviceConnected && (millis() - lastTx >= TX_INTERVAL_MS)) {
-        uint8_t packet[6];
-        buildPacket(packet);
+    if (digitalRead(CALIB_BUTTON_PIN) == LOW) {
+        delay(50);  // Debounce
+        if (digitalRead(CALIB_BUTTON_PIN) == LOW) {
+            runCalibration();
+            while (digitalRead(CALIB_BUTTON_PIN) == LOW) delay(10);  // Wait for release
+        }
+    }
+    
+    // Read sensors and transmit at fixed rate
+    if (millis() - lastTx >= TX_INTERVAL_MS) {
+        // Read all sensors
+        RawMag magMCP = sensorMCP.readMeasurement();
+        RawMag magPIP = sensorPIP.readMeasurement();
+        RawMag magDIP = sensorDIP.readMeasurement();
         
-        pCharacteristic->setValue(packet, 6);
-        pCharacteristic->notify();
-        
-        // Debug output (reduce rate for production)
-        static int debugCounter = 0;
-        if (++debugCounter >= 30) {  // Every ~1 second
-            Serial.printf("TX: seq=%d MCP=%d PIP=%d\n", 
-                packet[0], packet[1], packet[2]);
-            debugCounter = 0;
+        if (magMCP.valid && magPIP.valid && magDIP.valid) {
+            // Calculate angles (with calibration applied)
+            float angleMCP = sensorMCP.calculateAngle(magMCP);
+            float anglePIP = sensorPIP.calculateAngle(magPIP);
+            float angleDIP = sensorDIP.calculateAngle(magDIP);
+            
+            // Send packet
+            sendPacket(angleMCP, anglePIP, angleDIP);
+            
+            // Debug output (every ~1 second)
+            if (++debugCounter >= 50) {
+                Serial.printf("TX [%3d]: MCP=%.1f° PIP=%.1f° DIP=%.1f°\n",
+                    sequenceNumber - 1, angleMCP, anglePIP, angleDIP);
+                debugCounter = 0;
+            }
+        } else {
+            Serial.println("Warning: Invalid sensor reading");
         }
         
         lastTx = millis();
-    }
-    
-    // Handle reconnection
-    if (!deviceConnected && oldDeviceConnected) {
-        delay(500);  // Give BLE stack time to reset
-        pServer->startAdvertising();
-        Serial.println("Restarted advertising");
-        oldDeviceConnected = deviceConnected;
-    }
-    
-    if (deviceConnected && !oldDeviceConnected) {
-        oldDeviceConnected = deviceConnected;
     }
 }
