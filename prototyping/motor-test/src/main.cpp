@@ -1,87 +1,80 @@
 /**
- * BLDC Motor FOC Control Test (DRV8300 + AS5600)
+ * Minimal motor spin test — open-loop velocity, no FOC alignment, no encoder loop.
  *
- * Uses SimpleFOC with 6-PWM driver (high/low side per phase).
- * Accepts target angle via serial input.
+ * The motor should reliably spin in response to a commanded velocity (rad/s).
+ * If this works, the driver + motor + power path is healthy.
  *
  * Hardware:
  * - ESP32 DevKit v1
- * - DRV8300 custom motor driver PCB (6-PWM: high/low per phase)
- * - 2204 BLDC motor (7 pole pairs - NEEDS VERIFICATION)
- * - AS5600 encoder on I2C (SDA=21, SCL=22)
+ * - DRV8300 6-PWM driver, AH=5 AL=17 BH=16 BL=4 CH=2 CL=15
+ * - 2804 BLDC, 7 pole pairs
+ * - 12V (or up to 19V) bench supply
  *
- * Pin mapping (DRV8300 PCB):
- *   Phase A: high=25, low=26
- *   Phase B: high=27, low=14
- *   Phase C: high=12, low=13
- *
- * Original code by Matthew Men
+ * Serial commands (one per line):
+ *   <number>   target velocity in rad/s (e.g. 5, -5, 10, 0)
+ *   S          stop
  */
 
 #include <SimpleFOC.h>
-#include <Wire.h>
 
-// ---------- Encoder ----------
-MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
-
-// ---------- 6PWM Driver ----------
 BLDCDriver6PWM driver = BLDCDriver6PWM(
-  25, 26,   // Phase A high / low
-  27, 14,   // Phase B high / low
-  12, 13    // Phase C high / low
+  5,  17,
+  16, 4,
+  2,  15
 );
 
-// ---------- Motor ----------
-// Change pole pairs to your motor value
 BLDCMotor motor = BLDCMotor(7);
 
-float target_angle = 0;
+float target_velocity = 0.0f;     // rad/s (electrical-angle ramp rate × pole_pairs)
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(21, 22);
+  delay(200);
 
-  // Sensor init
-  sensor.init();
+  SimpleFOCDebug::enable(&Serial);        // print driver/motor init state to serial
 
-  // Link sensor
-  motor.linkSensor(&sensor);
-
-  // Driver settings
-  driver.voltage_power_supply = 10.0;   // your motor supply
-  driver.voltage_limit = 3.0;           // start LOW
-  driver.init();
-
+  driver.pwm_frequency        = 25000;
+  driver.voltage_power_supply = 12.0;
+  driver.voltage_limit        = 12.0;     // allow full driver swing
+  // dead_zone NOT set — let SimpleFOC use its default; core 3.x MCPWM also applies hw dead-time
+  if (!driver.init()) {
+    Serial.println("Driver init FAILED — halting");
+    while (1) delay(1000);
+  }
+  Serial.println("Driver init OK");
   motor.linkDriver(&driver);
 
-  // Control mode = angle position
-  motor.controller = MotionControlType::angle;
+  motor.controller    = MotionControlType::velocity_openloop;
+  motor.voltage_limit = 10.0;             // open-loop applied voltage — must overcome stiction
 
-  // PID defaults
-  motor.PID_velocity.P = 0.2;
-  motor.PID_velocity.I = 1;
-  motor.PID_velocity.D = 0;
-
-  motor.P_angle.P = 5;
-
-  // Init motor
   motor.init();
-  motor.initFOC();
+  Serial.println("Motor init done");
 
-  Serial.println("Enter target angle in degrees:");
+  Serial.println("Open-loop spin test ready.");
+  Serial.println("Cmds: <rad/s>  e.g. 5   |   S to stop");
 }
 
 void loop() {
-  motor.loopFOC();
+  motor.move(target_velocity);            // velocity_openloop just sweeps electrical angle
 
-  motor.move(target_angle);
-
-  // Serial input angle
-  if (Serial.available()) {
-    float deg = Serial.parseFloat();
-    target_angle = deg * 3.14159 / 180.0;
-
-    Serial.print("New Target: ");
-    Serial.println(deg);
+  static String buf = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (buf.length() > 0) {
+        if (buf[0] == 'S' || buf[0] == 's') {
+          target_velocity = 0;
+          Serial.println("Stop");
+        } else {
+          target_velocity = buf.toFloat();
+          Serial.print("Velocity = ");
+          Serial.print(target_velocity);
+          Serial.println(" rad/s");
+        }
+        buf = "";
+      }
+    } else if (c != ' ') {
+      buf += c;
+    }
   }
 }
