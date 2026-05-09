@@ -24,12 +24,17 @@
 #include <AS5600.h>
 
 // ---------- Pins ----------
-#define AH 5
-#define AL 17
-#define BH 16
-#define BL 4
-#define CH 2
-#define CL 15
+#define AH 25
+#define AL 26
+#define BH 27
+#define BL 14
+#define CH 12
+#define CL 13
+
+// Phase-current Hall sensors (200 mV/A)
+#define CSA 32
+#define CSB 33
+#define CSC 34
 
 #define PWM_FREQ      40000
 #define PWM_RES       8
@@ -87,6 +92,70 @@ void commutate(int step) {
   }
 }
 
+// ---------- Current-sense diagnostic ----------
+int adcAvg(int pin, int n) {
+  long sum = 0;
+  for (int i = 0; i < n; i++) sum += analogRead(pin);
+  return sum / n;
+}
+
+float countToAmps(int raw, int zero_count) {
+  float volts = (raw - zero_count) * (3.3f / 4096.0f);
+  return volts / 0.2f;  // 200 mV/A → 1V = 5A
+}
+
+void driveOnePhase(int highPin, int lowPin, uint8_t test_duty, uint32_t ms) {
+  allOff();
+  delayMicroseconds(DEADTIME_US);
+  ledcWrite(highPin, test_duty);
+  digitalWrite(lowPin, HIGH);
+  delay(ms);
+}
+
+// Drive each of the 6 commutation phase pairs in sequence and measure
+// the resulting current on all 3 Hall channels. Tells us:
+//  - which ADC channel maps to which motor phase
+//  - whether each channel actually responds to current
+//  - the zero-current bias of each channel
+void runCurrentDiagnostic() {
+  Serial.println("\n=== CURRENT-SENSE DIAGNOSTIC ===");
+  allOff();
+  delay(50);
+  int zA = adcAvg(CSA, 100);
+  int zB = adcAvg(CSB, 100);
+  int zC = adcAvg(CSC, 100);
+  Serial.printf("Zero bias counts: A=%d  B=%d  C=%d  (V: %.3f %.3f %.3f)\n",
+                zA, zB, zC,
+                zA * 3.3f / 4096.0f, zB * 3.3f / 4096.0f, zC * 3.3f / 4096.0f);
+
+  uint8_t test_duty = duty;
+  Serial.printf("Duty=%d/255 (%d%%), expected steady-state I ~ %.1fA\n",
+                test_duty, (test_duty * 100) / 255,
+                (test_duty / 255.0f) * 12.0f / 2.3f);
+
+  struct Step { const char* name; int hi; int lo; };
+  Step steps[] = {
+    {"A->B", AH, BL}, {"A->C", AH, CL},
+    {"B->C", BH, CL}, {"B->A", BH, AL},
+    {"C->A", CH, AL}, {"C->B", CH, BL},
+  };
+  Serial.println("Step    rawA  rawB  rawC    Ia(A)   Ib(A)   Ic(A)");
+  for (auto& s : steps) {
+    driveOnePhase(s.hi, s.lo, test_duty, 80);
+    int rA = adcAvg(CSA, 50);
+    int rB = adcAvg(CSB, 50);
+    int rC = adcAvg(CSC, 50);
+    allOff();
+    Serial.printf("%-6s  %4d  %4d  %4d   %+6.2f  %+6.2f  %+6.2f\n",
+                  s.name, rA, rB, rC,
+                  countToAmps(rA, zA),
+                  countToAmps(rB, zB),
+                  countToAmps(rC, zC));
+    delay(50);
+  }
+  Serial.println("=== diagnostic done ===\n");
+}
+
 // ---------- Encoder ----------
 // Read the AS5600 and update unwrapped angle_deg by accumulating deltas.
 void updateEncoder() {
@@ -133,6 +202,11 @@ void handleSerial() {
         Serial.print("Mode: target = ");
         Serial.print(target_deg);
         Serial.println(" deg");
+      } else if (first == 'D' || first == 'd') {
+        Mode prev = mode;
+        mode = MODE_STOP;
+        runCurrentDiagnostic();
+        mode = prev;
       } else {
         // Numeric -> duty %
         int val = input.toInt();
@@ -203,8 +277,16 @@ void setup() {
   updateEncoder();
   angle_deg = 0.0f;             // zero at startup
 
+  // ADC pins are input-only on ESP32; just confirm they read sensibly.
+  analogReadResolution(12);
+  pinMode(CSA, INPUT);
+  pinMode(CSB, INPUT);
+  pinMode(CSC, INPUT);
+  Serial.printf("CS idle: A=%d B=%d C=%d\n",
+                analogRead(CSA), analogRead(CSB), analogRead(CSC));
+
   Serial.println("Closed-loop test ready.");
-  Serial.println("Cmds: F | B | S | <0-100> duty | T<deg> target");
+  Serial.println("Cmds: F | B | S | <0-100> duty | T<deg> target | D current diag");
 }
 
 // ---------- Loop ----------

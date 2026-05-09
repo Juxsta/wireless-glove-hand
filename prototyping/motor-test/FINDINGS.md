@@ -1,8 +1,15 @@
-# BLDC Closed-Loop Control — Findings
+# BLDC Motor Control — Findings
 
-**Date:** 2026-05-06
+**Dates:** 2026-05-06 → 2026-05-07
 **Author:** Eric Reyes
-**Scope:** Bring up encoder-feedback closed-loop control for the 2204 BLDC motor on the DRV8300 driver, as part of the wireless glove → robotic arm pipeline.
+**Scope:** Bring up motor control for the 2204 BLDC + DRV8300 + (optional) AS5600 stack at each finger joint of the wireless-glove → arm pipeline.
+
+> **TL;DR (decision adopted 2026-05-07):** the production firmware uses
+> `SimpleFOC angle_openloop`, NO encoder, NO current sensing. A 20:1 gearbox
+> at each joint absorbs slip. ESP-NOW links the glove flex sensor to the
+> motor. See `prototyping/flex-motor-test/` for the production sketches.
+> The closed-loop FOC investigation that occupies most of this document is
+> kept as the trail-of-evidence that led to that decision.
 
 ## Goal
 
@@ -132,3 +139,96 @@ Three paths, in order of effort:
 - `prototyping/motor-test/src/main.cpp` — working closed-loop config (forced `Direction::CW`, voltage_limit=9V, P_angle=2)
 - `prototyping/motor-test/platformio.ini` — pioarduino 55.03.38-1, SimpleFOC 2.3.4+
 - `prototyping/closed-loop-test/` — hand-rolled 6-step + AS5600 unwrap; useful as a "no-library" baseline
+
+---
+
+# Update — 2026-05-07
+
+After another full session of trying to make closed-loop FOC reliable on this rig, we **abandoned the closed-loop approach** in favor of `angle_openloop` + the 20:1 gearbox. The closed-loop "cogging" diagnosis from 2026-05-06 was ultimately a *symptom*, not a root cause. The actual reasons closed-loop kept failing turned out to be a stack of hardware and software faults that compounded.
+
+## The faults we discovered (in the order that mattered)
+
+### 1. GPIO 13 on the ESP32 was dead
+Single biggest issue, discovered late via scope inspection. With `CL` (phase C low-side) wired to GPIO 13, **only 2 of 3 phases were ever switching**. Every test from May 6 — closed-loop, open-loop, hand-rolled — was running on a 2-phase motor that physically cannot make a complete electrical revolution. This invalidated all our earlier tuning.
+
+**Fix:** rewired CL from GPIO 13 → **GPIO 18**. After this, even the basic open-loop spin started working.
+
+### 2. AS5600 encoder was unreliable
+Multiple intermittent failures during the session:
+- I2C cable bursts of `ESP_ERR_INVALID_STATE` errors then quiet zeros
+- Magnet got knocked off the rotor at one point
+- Even when reading, often returned exact `0.0°` (sensor present on bus but reading garbage)
+
+For closed-loop FOC, the encoder feeds directly into the **Park transform**:
+```
+electrical_angle = pole_pairs × shaft_angle - zero_electric_angle
+```
+A bad `shaft_angle` makes `electrical_angle` wrong, which means **`Uq` is applied at the wrong axis** (mix of q-axis "torque" and d-axis "flux"). Anywhere the axis is wrong, electrical power becomes resistive heating instead of mechanical work — exactly matching the "motor stuck and getting hot" behavior we kept fighting.
+
+### 3. Pole pair count was empirically ambiguous
+SimpleFOC's `initFOC()` PP-check gave inconsistent estimates (`14.68` with software PP=7; `9.97` with software PP=14). Spec sheet says 7 (12N14P). Likely due to test conditions (cogging, partial settling between test points) skewing the estimator. We never got a confident empirical confirmation.
+
+### 4. Hall current sensors weren't actually reading phase current
+A diagnostic firmware that drove each phase pair individually and read all three Hall ADCs showed **<25 mA of differential signal** during 1.6 A test injections. The Hall sensors' mounting or wiring isn't where actual phase current flows. Without working current sense, FOC's automatic CS-polarity alignment failed nondeterministically — explaining why `MOT:Success: 2` happened only once across many boots.
+
+## Why open-loop sidesteps all of it
+
+| Failure mode | velocity_openloop | angle_openloop | closed-loop FOC |
+|---|---|---|---|
+| Bad encoder I2C reads | doesn't care | doesn't care | **fatal** |
+| Magnet displaced | doesn't care | doesn't care | **fatal** |
+| Wrong PP | minor inefficiency | minor inefficiency | **fatal** (Park transform misaligned) |
+| Wrong sensor_direction | doesn't care | doesn't care | **fatal** (torque applied opposite to motion) |
+| Wrong zero_electric_angle | doesn't care | doesn't care | **fatal** (Uq on flux axis = heat) |
+| CS polarity wrong | doesn't care | doesn't care | **fatal** (init fails) |
+| One phase pin dead | **fatal** | **fatal** | **fatal** |
+
+In open-loop modes SimpleFOC just synthesizes a rotating magnetic field at a commanded rate. The rotor's permanent magnets follow the field by physics. There is **no Park transform**, no electrical-angle estimation, no feedback loop — therefore none of the closed-loop failure modes apply.
+
+The price: we don't *measure* the rotor. `motor.shaft_angle` in the firmware is the **commanded** position (an integrator state), not measured. If the rotor slips a pole-pair (51° at the motor), we never know. **The 20:1 gearbox absorbs this**: a one-pole-pair slip is `51°/20 = 2.5°` at the joint — below human visual perception for a finger-pose mimic.
+
+## Production architecture (committed 2026-05-07)
+
+Lives in `prototyping/flex-motor-test/`. Two PIO envs each for the glove and motor side:
+
+| Env | File | Purpose |
+|---|---|---|
+| `transmitter` | `transmitter.cpp` | Glove side, **calibration UI** (`C0` flat, `C90` bent, `P` print) |
+| `transmitter_demo` | `transmitter_demo.cpp` | Glove side, hardcoded calibration constants, no UI — for demo |
+| `receiver_angle` | `receiver_angle.cpp` | Motor side, **calibration UI** (`T<deg>` manual, `M0`/`M90` capture, `X` exit) |
+| `receiver_angle_demo` | `receiver_angle_demo.cpp` | Motor side, hardcoded joint bounds, no UI — for demo |
+
+Pipeline:
+1. **Glove ESP32** reads flex sensor (analog GPIO 34), low-pass filters it (EMA α=0.2, ~80ms TC).
+2. Maps raw → joint angle `0..90°` via two-point linear calibration (`CAL_RAW_AT_0`, `CAL_RAW_AT_90`).
+3. Sends joint angle over **ESP-NOW** at 50 Hz to receiver.
+4. **Motor ESP32** receives angle, applies a second EMA (α=0.4) for additional smoothing.
+5. Maps glove angle to motor `target_rad` via interpolation between captured `M0_motor_rad` / `M90_motor_rad` (motor-side calibration of the joint's mechanical bounds).
+6. Drives motor in `MotionControlType::angle_openloop`. Motor pin map: `AH=25 AL=26 BH=27 BL=14 CH=12 CL=18`.
+
+### Adaptive `velocity_limit`
+Static `velocity_limit = 20 rad/s` worked for slow tracking but lagged on quick gestures. We added an adaptive scheme:
+```
+desired_vlim = (rate_of_glove_change × GEAR_RATIO) × HEADROOM
+motor.velocity_limit = clamp(desired_vlim, 30 rad/s, 250 rad/s)
+```
+- `HEADROOM = 2.0×` (so we can catch up after any phase lag)
+- Updated every 50 ms, with a further LPF (α=0.4) on the vlim value itself
+- Floor 30 rad/s ≈ 86°/s joint (idle, low-noise)
+- Ceiling 250 rad/s ≈ 716°/s joint (snap motion, near 12V/KV=220 mechanical max)
+
+### Calibration workflow (cal builds)
+On the glove (TX): hold finger flat → `C0`, fully bent → `C90`, then `P` to verify.
+On the motor (RX), with mechanical assembly attached:
+- `T<deg>` to manually drive motor, find motor angle that puts joint in "finger straight" position → `M0`
+- Repeat for "finger fully bent" position → `M90`
+- `X` to exit manual override; system tracks glove from then on.
+
+For the demo build: bake the captured constants into the `_demo.cpp` files and reflash.
+
+## Lessons (for the report and future-us)
+
+1. **Don't trust an encoder that's "responding"** without verifying the readings actually change. AS5600 happily ACKs on I2C without a magnet present and returns 0.
+2. **Verify driver outputs at the gate pins, not just at the firmware command layer.** A dead GPIO is invisible to all software-level diagnostics.
+3. **Open-loop drag-the-rotor-with-the-field isn't a hack** — it's the appropriate control mode when (a) the load is light, (b) absolute position can drift a few degrees, and (c) feedback infrastructure is too brittle to be the foundation of the demo. The 20:1 gearbox effectively turns the BLDC + open-loop combo into a stepper-with-microstepping in this application.
+4. **Symptoms ≠ causes.** The "cogging detents" framing on May 6 was wrong; we were really seeing FOC misalignment producing no torque (just heat). On a properly-aligned closed-loop, even this motor's cogging is escapable at modest Uq.
