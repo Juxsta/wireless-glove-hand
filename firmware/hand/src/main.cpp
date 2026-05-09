@@ -1,322 +1,293 @@
 /**
- * Wireless Glove Interface - Hand Firmware (Receiver + Motor Control)
- * 
- * Receives joint angles via ESP-NOW and controls 2204 BLDC motors with FOC.
- * 
+ * HAND — Production firmware (2-motor receiver, no encoder, no current sense)
+ *
+ * Listens for ESP-NOW glove angles and drives two BLDC motors via SimpleFOC
+ * `angle_openloop`. Adaptive velocity_limit per motor scales with the rate
+ * of glove change so quick gestures don't lag. Calibration values
+ * (per-joint M0/M90 motor positions) persist in NVS.
+ *
  * Hardware:
- * - ESP32 DevKit v1
- * - 4x DRV8300 custom motor driver PCBs (designed by Raul)
- * - 4x 2204 BLDC motors (sourced by Matthew)
- * - 4x AS5600 encoders via TCA9548A I2C mux
- * 
- * Protocol: ESP-NOW (from glove controller)
- * 
- * Motor driver PCB designed by Raul Hernandez-Solis (DRV8300 + ACS37042)
- * Motors sourced and tested by Matthew Men
- * FOC integration and firmware by Eric Reyes
+ *  - ESP32 DevKit v1
+ *  - 2× DRV8300 6-PWM driver
+ *      Motor 1 (joint 0):  AH=25 AL=26 BH=27 BL=14 CH=12 CL=18
+ *      Motor 2 (joint 1):  AH=4  AL=16 BH=17 BL=19 CH=21 CL=23
+ *  - 2× 2204 BLDC, 7 pole pairs, 12V supply
+ *  - 20:1 reduction gearbox per joint
+ *  - NO encoder, NO current sense (open-loop)
+ *
+ * Serial commands:
+ *   T1<deg>  manual override of motor 1 (motor-frame degrees), for cal
+ *   T2<deg>  manual override of motor 2
+ *   X        exit manual override, follow glove again
+ *   M0       capture current motor positions as the glove-0° mapping
+ *            (call when both joints are physically at "finger straight")
+ *   M90      capture as glove-90° mapping (joints at "fully bent")
+ *   S        save calibration to NVS
+ *   R        reset calibration to defaults
+ *   P        print calibration + state
  */
 
-#include <Arduino.h>
 #include <SimpleFOC.h>
-#include <Wire.h>
-#include <esp_now.h>
 #include <WiFi.h>
+#include <esp_now.h>
+#include <esp_mac.h>
+#include <Preferences.h>
 
-// =============================================================================
-// Configuration
-// =============================================================================
+// ----- Joint count -----
+constexpr int N_JOINTS = 2;
 
-// TODO: Verify pole pair count for 2204 motors from Matthew/datasheet
-// Common values: 7, 11, 12, 14
-#define MOTOR_POLE_PAIRS 7  // *** NEEDS VERIFICATION ***
+// ----- Drivers + motors -----
+BLDCDriver6PWM driver0 = BLDCDriver6PWM(25, 26, 27, 14, 12, 18);
+BLDCDriver6PWM driver1 = BLDCDriver6PWM(4,  16, 17, 19, 21, 23);
+BLDCMotor      motor0  = BLDCMotor(7);
+BLDCMotor      motor1  = BLDCMotor(7);
+BLDCMotor*     motors [N_JOINTS] = { &motor0, &motor1 };
+BLDCDriver6PWM* drivers[N_JOINTS] = { &driver0, &driver1 };
 
-// I2C Multiplexer (for 4x AS5600 encoders)
-#define TCA9548A_ADDR 0x70
-#define I2C_SDA 21
-#define I2C_SCL 22
+// ----- Constants -----
+constexpr float    GEAR_RATIO    = 20.0f;
+constexpr int      GLOVE_MIN_DEG = 0;
+constexpr int      GLOVE_MAX_DEG = 90;
+constexpr float    RX_ALPHA      = 0.4f;
+constexpr float    VL_MIN_RAD_S  = 30.0f;
+constexpr float    VL_MAX_RAD_S  = 250.0f;
+constexpr float    VL_HEADROOM   = 2.0f;
+constexpr uint32_t VL_PERIOD_MS  = 50;
+constexpr float    VL_LPF_ALPHA  = 0.4f;
+constexpr float    VOLTAGE_LIMIT = 6.0f;     // ~2.6A peak through 2.3Ω
 
-// Motor pin definitions
-// NOTE: These are placeholders for DRV8302 - WILL CHANGE for DRV8300 PCB
-// TODO: Update pin mappings once Raul provides DRV8300 PCB schematic
+// ----- Wire-format packet (MUST match glove transmitter) -----
+typedef struct __attribute__((packed)) {
+  int16_t angle[N_JOINTS];     // 0..90 deg, joint frame
+} GloveMessage;
 
-// Motor 0 - MCP Joint
-#define M0_PWM_A 25
-#define M0_PWM_B 26
-#define M0_PWM_C 27
-#define M0_EN    14
-
-// Motor 1 - PIP Joint
-#define M1_PWM_A 16
-#define M1_PWM_B 17
-#define M1_PWM_C 18
-#define M1_EN    15
-
-// Motor 2 - DIP Joint
-#define M2_PWM_A 19
-#define M2_PWM_B 21
-#define M2_PWM_C 22
-#define M2_EN    23
-
-// Motor 3 - TIP Joint
-#define M3_PWM_A 32
-#define M3_PWM_B 33
-#define M3_PWM_C 13
-#define M3_EN    12
-
-// TODO: Add ACS37042 current sense pins (on DRV8300 PCB, future feature)
-// Will enable torque control mode in SimpleFOC
-
-// Number of motors for PoC (start with 1, scale to 4)
-#define NUM_MOTORS 1  // Increase when ready for full finger
-
-// FOC control frequency
-#define FOC_LOOP_HZ 1000  // Target 1kHz
-
-// =============================================================================
-// ESP-NOW Packet Structure (must match glove firmware)
-// =============================================================================
-
-struct __attribute__((packed)) GlovePacket {
-    uint8_t sequence;      // Sequence number (0-255, wraps)
-    int16_t mcp_angle;     // MCP angle in degrees * 10
-    int16_t pip_angle;     // PIP angle in degrees * 10
-    int16_t dip_angle;     // DIP angle in degrees * 10
-    uint8_t reserved;      // Reserved
-    uint8_t checksum;      // XOR checksum
+// ----- Calibration state (persisted in NVS) -----
+struct CalState {
+  float M0_motor_rad [N_JOINTS];
+  float M90_motor_rad[N_JOINTS];
+} cal = {
+  { 0.0f, 0.0f },
+  { 90.0f * GEAR_RATIO * (PI / 180.0f), 90.0f * GEAR_RATIO * (PI / 180.0f) },
 };
 
-// Received data (volatile - accessed in ISR)
-volatile GlovePacket latestPacket = {0};
-volatile bool newPacketAvailable = false;
-volatile uint8_t lastSequence = 255;
-volatile uint32_t packetsReceived = 0;
-volatile uint32_t packetsLost = 0;
+// ----- Live state -----
+volatile int16_t  g_lastAngle[N_JOINTS] = {0, 0};
+volatile bool     g_haveData = false;
+volatile uint32_t g_lastRxMs = 0;
 
-// =============================================================================
-// Motor & Encoder Objects
-// =============================================================================
+float smooth_glove_deg[N_JOINTS] = {0.0f, 0.0f};
+bool  rx_primed      [N_JOINTS] = {false, false};
 
-// Motor 0 (MCP joint) - single motor for PoC
-BLDCMotor motor0 = BLDCMotor(MOTOR_POLE_PAIRS);
-BLDCDriver3PWM driver0 = BLDCDriver3PWM(M0_PWM_A, M0_PWM_B, M0_PWM_C, M0_EN);
-MagneticSensorI2C sensor0 = MagneticSensorI2C(AS5600_I2C);
+bool  manualOverride [N_JOINTS] = {false, false};
+float manualTargetRad[N_JOINTS] = {0.0f, 0.0f};
 
-// TODO: Uncomment when scaling to 4 motors
-// BLDCMotor motor1 = BLDCMotor(MOTOR_POLE_PAIRS);
-// BLDCDriver3PWM driver1 = BLDCDriver3PWM(M1_PWM_A, M1_PWM_B, M1_PWM_C, M1_EN);
-// MagneticSensorI2C sensor1 = MagneticSensorI2C(AS5600_I2C);
+Preferences prefs;
 
-// ... motor2, motor3 ...
-
-// =============================================================================
-// I2C Multiplexer
-// =============================================================================
-
-void selectI2CChannel(uint8_t channel) {
-    if (channel > 7) return;
-    Wire.beginTransmission(TCA9548A_ADDR);
-    Wire.write(1 << channel);
-    Wire.endTransmission();
+// ----- Helpers -----
+float gloveDegToMotorRad(int joint, float deg) {
+  if (deg < GLOVE_MIN_DEG) deg = GLOVE_MIN_DEG;
+  if (deg > GLOVE_MAX_DEG) deg = GLOVE_MAX_DEG;
+  float t = deg / (float)GLOVE_MAX_DEG;
+  return cal.M0_motor_rad[joint]
+       + t * (cal.M90_motor_rad[joint] - cal.M0_motor_rad[joint]);
 }
 
-// =============================================================================
-// ESP-NOW Callbacks
-// =============================================================================
-
-void onDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
-    if (len != sizeof(GlovePacket)) {
-        Serial.printf("ESP-NOW: Wrong packet size (%d bytes)\n", len);
-        return;
-    }
-    
-    GlovePacket packet;
-    memcpy(&packet, data, sizeof(GlovePacket));
-    
-    // Verify checksum
-    uint8_t checksum = 0;
-    uint8_t* pdata = (uint8_t*)&packet;
-    for (int i = 0; i < sizeof(GlovePacket) - 1; i++) {
-        checksum ^= pdata[i];
-    }
-    
-    if (checksum != packet.checksum) {
-        Serial.println("ESP-NOW: Checksum error");
-        return;
-    }
-    
-    // Track packet loss
-    if (lastSequence != 255) {
-        uint8_t expected = (lastSequence + 1) % 256;
-        if (packet.sequence != expected) {
-            int lost = (packet.sequence - expected + 256) % 256;
-            packetsLost += lost;
-            Serial.printf("ESP-NOW: Lost %d packets (seq %d -> %d)\n", 
-                lost, lastSequence, packet.sequence);
-        }
-    }
-    
-    lastSequence = packet.sequence;
-    packetsReceived++;
-    
-    // Store packet for main loop
-    latestPacket = packet;
-    newPacketAvailable = true;
+float smoothedGloveDeg(int joint) {
+  int raw = g_lastAngle[joint];
+  if (!rx_primed[joint]) {
+    smooth_glove_deg[joint] = raw;
+    rx_primed[joint] = true;
+  } else {
+    smooth_glove_deg[joint] =
+      RX_ALPHA * raw + (1.0f - RX_ALPHA) * smooth_glove_deg[joint];
+  }
+  return smooth_glove_deg[joint];
 }
 
-// =============================================================================
-// Motor Control
-// =============================================================================
-
-void initMotor() {
-    Serial.println("Initializing motor system...");
-    
-    // Initialize I2C for encoders
-    Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000);  // 400kHz I2C
-    
-    // Select encoder channel 0 (MCP joint)
-    selectI2CChannel(0);
-    delay(10);
-    
-    // Initialize encoder
-    sensor0.init();
-    motor0.linkSensor(&sensor0);
-    Serial.println("Encoder 0 initialized");
-    
-    // Initialize driver
-    driver0.voltage_power_supply = 7.4;  // 2S LiPo
-    driver0.init();
-    motor0.linkDriver(&driver0);
-    Serial.println("Driver 0 initialized");
-    
-    // FOC configuration
-    motor0.foc_modulation = FOCModulationType::SpaceVectorPWM;
-    motor0.controller = MotionControlType::angle;
-    
-    // PID tuning (start conservative, tune later)
-    motor0.PID_velocity.P = 0.2;
-    motor0.PID_velocity.I = 10;
-    motor0.PID_velocity.D = 0;
-    motor0.PID_velocity.output_ramp = 1000;
-    
-    motor0.P_angle.P = 20;
-    motor0.velocity_limit = 20;  // rad/s
-    motor0.voltage_limit = 6;    // V (safe for tuning)
-    
-    // Initialize motor
-    Serial.println("Initializing motor FOC...");
-    motor0.init();
-    motor0.initFOC();
-    
-    Serial.println("Motor 0 ready!");
-    
-    // TODO: Initialize motors 1-3 when scaling up
+float updateAdaptiveVelocityLimit(int joint, float smooth_glove) {
+  static uint32_t last_ms[N_JOINTS]      = {0, 0};
+  static float    last_smooth[N_JOINTS]  = {0.0f, 0.0f};
+  static float    vlim_filt[N_JOINTS]    = {VL_MIN_RAD_S, VL_MIN_RAD_S};
+  uint32_t now = millis();
+  if (now - last_ms[joint] >= VL_PERIOD_MS) {
+    float dt_s = (now - last_ms[joint]) / 1000.0f;
+    float rate_joint_deg_s = fabsf(smooth_glove - last_smooth[joint]) / dt_s;
+    float motor_rate_rad_s = rate_joint_deg_s * GEAR_RATIO * (PI / 180.0f);
+    float target_vlim      = motor_rate_rad_s * VL_HEADROOM;
+    if (target_vlim < VL_MIN_RAD_S) target_vlim = VL_MIN_RAD_S;
+    if (target_vlim > VL_MAX_RAD_S) target_vlim = VL_MAX_RAD_S;
+    vlim_filt[joint] = VL_LPF_ALPHA * target_vlim + (1.0f - VL_LPF_ALPHA) * vlim_filt[joint];
+    last_ms[joint]     = now;
+    last_smooth[joint] = smooth_glove;
+  }
+  return vlim_filt[joint];
 }
 
-float degreesToRadians(int16_t degrees_times_10) {
-    // Convert degrees*10 to radians
-    // Example: 450 (45.0°) -> 0.785 rad
-    float degrees = degrees_times_10 / 10.0f;
-    return degrees * PI / 180.0f;
+// ----- ESP-NOW -----
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(GloveMessage)) return;
+  GloveMessage m;
+  memcpy(&m, data, sizeof(m));
+  for (int j = 0; j < N_JOINTS; j++) g_lastAngle[j] = m.angle[j];
+  g_haveData  = true;
+  g_lastRxMs  = millis();
 }
 
-// =============================================================================
-// Setup
-// =============================================================================
+// ----- NVS persistence -----
+void loadCal() {
+  prefs.begin("hand", true);
+  cal.M0_motor_rad[0]  = prefs.getFloat("m0_0",  cal.M0_motor_rad[0]);
+  cal.M0_motor_rad[1]  = prefs.getFloat("m0_1",  cal.M0_motor_rad[1]);
+  cal.M90_motor_rad[0] = prefs.getFloat("m90_0", cal.M90_motor_rad[0]);
+  cal.M90_motor_rad[1] = prefs.getFloat("m90_1", cal.M90_motor_rad[1]);
+  prefs.end();
+}
+
+void saveCal() {
+  prefs.begin("hand", false);
+  prefs.putFloat("m0_0",  cal.M0_motor_rad[0]);
+  prefs.putFloat("m0_1",  cal.M0_motor_rad[1]);
+  prefs.putFloat("m90_0", cal.M90_motor_rad[0]);
+  prefs.putFloat("m90_1", cal.M90_motor_rad[1]);
+  prefs.end();
+}
+
+void resetCal() {
+  cal.M0_motor_rad[0]  = 0.0f;
+  cal.M0_motor_rad[1]  = 0.0f;
+  cal.M90_motor_rad[0] = 90.0f * GEAR_RATIO * (PI / 180.0f);
+  cal.M90_motor_rad[1] = 90.0f * GEAR_RATIO * (PI / 180.0f);
+}
+
+void printCal() {
+  Serial.printf("CAL: J0  M0=%.2f rad (%.0f°)  M90=%.2f rad (%.0f°)\n",
+                cal.M0_motor_rad[0],  cal.M0_motor_rad[0]  * 180.0f / PI,
+                cal.M90_motor_rad[0], cal.M90_motor_rad[0] * 180.0f / PI);
+  Serial.printf("     J1  M0=%.2f rad (%.0f°)  M90=%.2f rad (%.0f°)\n",
+                cal.M0_motor_rad[1],  cal.M0_motor_rad[1]  * 180.0f / PI,
+                cal.M90_motor_rad[1], cal.M90_motor_rad[1] * 180.0f / PI);
+}
+
+// Compute the current "live" target_rad for a joint (manual override or gloved).
+float currentTarget(int joint) {
+  if (manualOverride[joint]) return manualTargetRad[joint];
+  return gloveDegToMotorRad(joint, smooth_glove_deg[joint]);
+}
+
+// ----- Serial command parser -----
+void handleSerial() {
+  static String buf = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (buf.length() == 0) continue;
+      String s = buf; s.toUpperCase(); buf = "";
+
+      if (s.startsWith("T1") || s.startsWith("T2")) {
+        int j = (s.charAt(1) == '1') ? 0 : 1;
+        float deg = s.substring(2).toFloat();
+        manualTargetRad[j] = deg * PI / 180.0f;
+        manualOverride[j]  = true;
+        Serial.printf("Manual override J%d: %.1f° (%.3f rad)\n",
+                      j, deg, manualTargetRad[j]);
+      } else if (s == "X") {
+        manualOverride[0] = false;
+        manualOverride[1] = false;
+        Serial.println("Manual override OFF — both joints follow glove");
+      } else if (s == "M0") {
+        cal.M0_motor_rad[0] = currentTarget(0);
+        cal.M0_motor_rad[1] = currentTarget(1);
+        Serial.printf("CAL captured M0: J0=%.3f  J1=%.3f rad  (run 'S' to save)\n",
+                      cal.M0_motor_rad[0], cal.M0_motor_rad[1]);
+      } else if (s == "M90") {
+        cal.M90_motor_rad[0] = currentTarget(0);
+        cal.M90_motor_rad[1] = currentTarget(1);
+        Serial.printf("CAL captured M90: J0=%.3f  J1=%.3f rad  (run 'S' to save)\n",
+                      cal.M90_motor_rad[0], cal.M90_motor_rad[1]);
+      } else if (s == "S") {
+        saveCal();
+        Serial.println("CAL saved to NVS");
+      } else if (s == "R") {
+        resetCal();
+        Serial.println("CAL reset to defaults (run 'S' to persist)");
+      } else if (s == "P") {
+        printCal();
+      } else {
+        Serial.printf("unknown cmd: %s\n", s.c_str());
+      }
+    } else {
+      buf += c;
+    }
+  }
+}
 
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    
-    Serial.println("\n=== Wireless Glove - Hand Controller ===");
-    Serial.println("Based on 2204 BLDC motors + DRV8300 PCB + SimpleFOC");
-    Serial.println("EE198B Senior Project - SJSU 2026\n");
-    
-    Serial.printf("Motor pole pairs: %d (VERIFY THIS!)\n", MOTOR_POLE_PAIRS);
-    Serial.println("DRV8300 PCB pin mappings: PLACEHOLDER (update from Raul)\n");
-    
-    // Initialize motor system
-    initMotor();
-    
-    // Initialize ESP-NOW
-    WiFi.mode(WIFI_STA);
-    Serial.print("Hand MAC Address: ");
-    Serial.println(WiFi.macAddress());
-    Serial.println("Configure this MAC in glove firmware (RECEIVER_MAC)\n");
-    
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("Error initializing ESP-NOW");
-        return;
+  Serial.begin(115200);
+  delay(200);
+
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  Serial.printf("\n=== HAND RX ===\nRX MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (1) delay(1000);
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Init both motor stacks
+  for (int j = 0; j < N_JOINTS; j++) {
+    drivers[j]->pwm_frequency        = 25000;
+    drivers[j]->voltage_power_supply = 12.0;
+    drivers[j]->voltage_limit        = 12.0;
+    if (!drivers[j]->init()) {
+      Serial.printf("Driver %d init FAILED\n", j);
+      while (1) delay(1000);
     }
-    
-    esp_now_register_recv_cb(onDataRecv);
-    
-    Serial.println("=== Ready to receive ===");
-    Serial.println("Waiting for glove controller packets...\n");
+    motors[j]->linkDriver(drivers[j]);
+    motors[j]->controller     = MotionControlType::angle_openloop;
+    motors[j]->voltage_limit  = VOLTAGE_LIMIT;
+    motors[j]->velocity_limit = VL_MIN_RAD_S;
+    motors[j]->init();
+    Serial.printf("Motor %d ready\n", j);
+  }
+
+  loadCal();
+  printCal();
+
+  Serial.println("Ready. Cmds: T1<d>|T2<d> | X | M0 | M90 | S save | R reset | P print");
 }
 
-// =============================================================================
-// Main Loop
-// =============================================================================
-
 void loop() {
-    static unsigned long lastDebug = 0;
-    static unsigned long lastFOC = 0;
-    
-    // High-frequency FOC loop (aim for 1kHz)
-    unsigned long now = micros();
-    if (now - lastFOC >= 1000) {  // 1ms = 1kHz
-        motor0.loopFOC();
-        lastFOC = now;
-    }
-    
-    // Apply new target angle when received
-    if (newPacketAvailable) {
-        noInterrupts();
-        GlovePacket packet = latestPacket;
-        newPacketAvailable = false;
-        interrupts();
-        
-        // Convert MCP angle to radians
-        float targetAngle = degreesToRadians(packet.mcp_angle);
-        
-        // Clamp to safe range (0-90° = 0-PI/2 rad)
-        targetAngle = constrain(targetAngle, 0, PI / 2);
-        
-        // Update motor target
-        motor0.move(targetAngle);
-        
-        // Debug output every ~1 second
-        if (millis() - lastDebug >= 1000) {
-            float currentAngle = sensor0.getAngle();
-            float voltage = motor0.voltage.q;
-            
-            Serial.printf("[%3d] Target: %.2f rad (%.1f°) | Current: %.2f rad (%.1f°) | V: %.2fV | Pkts: %lu (lost: %lu)\n",
-                packet.sequence,
-                targetAngle, targetAngle * 180 / PI,
-                currentAngle, currentAngle * 180 / PI,
-                voltage,
-                packetsReceived, packetsLost);
-            
-            lastDebug = millis();
-        }
-    } else {
-        // Continue moving to last target
-        motor0.move();
-    }
-    
-    // Print status if no packets received in 5 seconds
-    static unsigned long lastPacketTime = 0;
-    if (newPacketAvailable) {
-        lastPacketTime = millis();
-    } else if (millis() - lastPacketTime > 5000 && packetsReceived == 0) {
-        static unsigned long lastWarning = 0;
-        if (millis() - lastWarning > 5000) {
-            Serial.println("WARNING: No packets received. Check:");
-            Serial.println("  1. Glove controller is powered on");
-            Serial.println("  2. RECEIVER_MAC in glove firmware matches this MAC");
-            Serial.println("  3. Both devices on same WiFi channel");
-            lastWarning = millis();
-        }
-    }
+  handleSerial();
+
+  for (int j = 0; j < N_JOINTS; j++) {
+    float gloveDeg = smoothedGloveDeg(j);
+    motors[j]->velocity_limit = updateAdaptiveVelocityLimit(j, gloveDeg);
+    float target_rad;
+    if (manualOverride[j]) target_rad = manualTargetRad[j];
+    else                   target_rad = gloveDegToMotorRad(j, gloveDeg);
+    motors[j]->loopFOC();
+    motors[j]->move(target_rad);
+  }
+
+  // Status print 5 Hz
+  static uint32_t lastPrint = 0;
+  uint32_t now = millis();
+  if (now - lastPrint > 200) {
+    lastPrint = now;
+    bool fresh = g_haveData && (now - g_lastRxMs < 500);
+    Serial.printf("J0 g=%d s=%.1f tgt=%.2f vlim=%.0f manual=%d  |  "
+                  "J1 g=%d s=%.1f tgt=%.2f vlim=%.0f manual=%d  |  link=%s\n",
+                  g_lastAngle[0], smooth_glove_deg[0],
+                  manualOverride[0] ? manualTargetRad[0] : gloveDegToMotorRad(0, smooth_glove_deg[0]),
+                  motors[0]->velocity_limit, manualOverride[0],
+                  g_lastAngle[1], smooth_glove_deg[1],
+                  manualOverride[1] ? manualTargetRad[1] : gloveDegToMotorRad(1, smooth_glove_deg[1]),
+                  motors[1]->velocity_limit, manualOverride[1],
+                  fresh ? "OK" : "STALE");
+  }
 }
