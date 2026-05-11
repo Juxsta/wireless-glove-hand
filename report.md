@@ -218,3 +218,139 @@ GPIO 13 is **not** used on the hand — it failed on the specific ESP32 board th
 4. **Open-loop drag-the-rotor-with-the-field is not a hack** when (a) the load is light, (b) gearbox reduction absorbs slip, and (c) the alternative is fragility. For this application it was the right call.
 
 5. **Reduction ratios are the great equalizer.** A 20:1 cycloidal drive converts a 51° motor pole-pair slip into 2.5° at the joint — that's the difference between "obviously broken" and "below human perception." Mechanical design choices upstream can rescue control choices downstream.
+
+---
+
+## Appendix A: Diagnostic Data
+
+The following are verbatim serial transcripts captured during the 2026-05-06 / 2026-05-07 debug sessions. They are the concrete evidence behind the conclusions in Section 4.
+
+### A.1 Hall current-sense diagnostic
+
+To verify whether the on-board Hall current sensors actually responded to phase current, the hand-rolled `closed-loop-test/` firmware was modified to drive each of the six commutation phase-pairs in sequence at 29 % duty (`duty = 76/255`) for 80 ms each, then read all three Hall ADCs and convert to amps using the spec'd 200 mV/A sensitivity:
+
+```
+=== CURRENT-SENSE DIAGNOSTIC ===
+Zero bias counts: A=1771  B=1769  C=1896  (V: 1.427 1.425 1.528)
+Duty=76/255 (29%), expected steady-state I ~ 1.6A
+
+Step    rawA  rawB  rawC    Ia(A)   Ib(A)   Ic(A)
+A->B    1770  1767  1896    -0.00   -0.01   +0.00
+A->C    1770  1768  1897    -0.00   -0.00   +0.00
+B->C    1773  1767  1902    +0.01   -0.01   +0.02
+B->A    1771  1768  1896    +0.00   -0.00   +0.00
+C->A    1772  1766  1896    +0.00   -0.01   +0.00
+C->B    1773  1768  1896    +0.01   -0.00   +0.00
+```
+
+The motor was confirmed energized during this run (independently driven into rotation in open-loop). The Hall outputs do not register the expected ~1.6 A flow on **any** channel — variations of 1–6 ADC counts (≈ 5–25 mA at 200 mV/A) are at the noise floor. **The Hall sensors are not physically wrapping the phase conductors** — likely mounted at a position in the PCB that doesn't carry the phase return current. This is the direct cause of the repeated `CS: Err too low current, rise voltage!` alignment failures from `motor.initFOC()`.
+
+### A.2 AS5600 encoder behavior
+
+**Normal boot, magnet present (early in the session):**
+```
+AS5600 connected. magnet detected=1 tooWeak=1 tooStrong=0 rawAngle=3954
+```
+(The `tooWeak=1` flag is a quirk of the AS5600 Arduino library's reporting of the AGC bit and is not a functional warning when other reads are stable.)
+
+Open-loop spin (with motor energized via F mode at 50 % duty) produced raw values cycling continuously through the full 0..4095 range:
+```
+raw=1420 → 3156 → 831 → 2695 → 237 → 1972 → 1677 → 3442 → ...
+```
+demonstrating the encoder was operational and tracking rotation.
+
+**Later in the same session, after rewiring:**
+```
+=== boot/initFOC ===
+sensor_raw=0.0 deg
+sensor_raw=0.0 deg
+...
+[3723][E][esp32-hal-i2c-ng.c:372] i2cWriteReadNonStop(): i2c_master_transmit_receive failed: [259] ESP_ERR_INVALID_STATE
+[3735][E][Wire.cpp:520] requestFrom(): i2cWriteReadNonStop returned Error 259
+[3742][E][esp32-hal-i2c-ng.c:372] i2cWriteReadNonStop(): ... failed: [259] ESP_ERR_INVALID_STATE
+... (bursts of identical errors continue) ...
+sensor_raw=0.0 deg          # back to silent zero after bus errors clear
+```
+This is the signature of a marginally seated I²C cable: bursts of bus-fault errors followed by the slave (AS5600) responding to its address but returning zero data. With manual rotation of the rotor during this period the reported `sensor_raw` did not change — the encoder was effectively dead from the firmware's perspective.
+
+### A.3 SimpleFOC `initFOC()` alignment outcomes
+
+The same firmware was rebooted multiple times without code changes between attempts. Observed outcomes:
+
+```
+# Run 1 — auto-detection
+MOT:Align sensor.
+MOT:sensor dir: CCW
+WARN-MOT:PP check: fail - est. pp: 14.68
+Skip dir calib.
+MOT:Zero elec. angle: 4.83
+MOT:Align current sense.
+CS: Err too low current, rise voltage!
+ERR-MOT:Align error!
+ERR-MOT:Init FOC fail
+initFOC = 0
+
+# Run 2 — same config, different boot
+MOT:Align sensor.
+MOT:Skip dir calib.
+MOT:Zero elec. angle: 5.41
+MOT:Align current sense.
+CS: Switch A-C
+CS: Switch B-C
+MOT:Success: 2
+MOT:Ready.
+initFOC = 1
+
+# Run 3 — PP forced to 14
+WARN-MOT:PP check: fail - est. pp: 9.97
+ERR-MOT:Init FOC fail
+
+# Run 4 — direction forced to CCW
+MOT:Align current sense.
+CS: Inv A
+CS: Err align B
+ERR-MOT:Align error!
+ERR-MOT:Init FOC fail
+```
+
+The PP-check empirically returned `14.68` and `9.97` for the same physical motor depending on conditions. Spec sheet for the 2804 says 12N14P → 7 pole pairs. The estimator is sensitive to whether the rotor settles cleanly at each electrical test point — cogging interferes.
+
+### A.4 Motor runaway under closed-loop FOC
+
+After one of the successful `initFOC = 1` runs, with `MotionControlType::angle`, the position controller commanded `Uq=-12V` (saturated) continuously while the rotor ran away in the positive direction:
+
+```
+target=0.0 deg  shaft=343.4 deg     vel=4.01 rad/s    Uq=-12.00
+target=0.0 deg  shaft=343.4 deg     vel=2.17 rad/s    Uq=-12.00
+... rotor at ~343° with Uq sat ...
+                shaft=8099.2 deg    vel=158.15        Uq=-12.00
+                shaft=11726.5 deg   vel=160.26        Uq=-12.00
+                shaft=15360.2 deg   vel=159.61        Uq=-12.00
+                shaft=156625.5 deg  vel=138.94        Uq=-12.00
+```
+
+`shaft_angle` accumulated from 0° to over 156,000° (≈430 mechanical revolutions) at a steady ~155 rad/s motor speed. The controller could not catch up because applying `Uq` at the wrong electrical axis (consequence of bad encoder readings) was producing motion in the same direction as the error growth, not against it. This is the closed-loop sign-error failure mode described in Section 4.4.
+
+### A.5 ESP-NOW link characterization
+
+After flashing the production hand firmware (post-rewire), the link came up immediately:
+
+```
+=== HAND RX ===
+RX MAC: B0:CB:D8:8B:55:04
+Motor 0 ready
+Motor 1 ready
+CAL: J0  M0=0.00 rad (0°)  M90=31.42 rad (1800°)
+     J1  M0=0.00 rad (0°)  M90=31.42 rad (1800°)
+Ready. Cmds: T1<d>|T2<d> | X | M0 | M90 | S save | R reset | P print
+J0 g=9  s=9.0  tgt=3.14 vlim=15 manual=0  |  J1 g=0  s=0.0  tgt=0.00 vlim=15 manual=0  |  link=OK
+J0 g=21 s=21.0 tgt=7.33 vlim=15 manual=0  |  J1 g=16 s=16.0 tgt=5.59 vlim=15 manual=0  |  link=OK
+J0 g=21 s=21.0 tgt=7.33 vlim=15 manual=0  |  J1 g=33 s=33.0 tgt=11.52 vlim=67 manual=0  |  link=OK
+J0 g=14 s=14.0 tgt=4.89 vlim=27 manual=0  |  J1 g=52 s=52.0 tgt=18.15 vlim=54 manual=0  |  link=OK
+```
+
+The transmitter was paired (MAC hardcoded), update rate 50 Hz, `link=OK` reported whenever a packet arrived in the last 500 ms. The `vlim` column shows the adaptive velocity limit responding to gesture speed: idle joints sit at the floor of 15 rad/s; J1's brief jump from 16° → 33° → 52° pushed vlim transiently to 67 rad/s before settling back as the motion completed.
+
+### A.6 GPIO 13 (CL pin) failure
+
+Before the GPIO 13 → GPIO 18 rewire, with the raw PWM force-test firmware (deliberately driving GPIO 25, 27, **and 13** at 50 % duty), oscilloscope verification (user-confirmed) showed PWM present on GPIO 25 and GPIO 27 but **no output** on GPIO 13. The pin was responding to `ledcAttach()` in software (returned non-zero success), and `ledcWrite(13, 128)` was being executed by the loop, but no signal appeared at the pin. After rewiring CL to GPIO 18 the open-loop spin-test produced clean rotation immediately and consistently — confirming GPIO 13 was the dead pin and not any of the other 5 driver inputs. This was the largest single fault in the closed-loop debug history.
