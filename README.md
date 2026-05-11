@@ -1,7 +1,7 @@
 # Wireless Glove Interface for Real-Time Robotic Hand Mimicry
 
-**EE198A/B Senior Project — San Jose State University**  
-**Department of Electrical Engineering**  
+**EE198A/B Senior Project — San Jose State University**
+**Department of Electrical Engineering**
 **Spring 2026**
 
 ## Team
@@ -17,158 +17,152 @@
 
 ## Abstract
 
-This project implements a wearable glove system with MLX90395 Hall-effect magnetic sensors at each finger joint that wirelessly controls a 3D-printed robotic hand. The system uses Field Oriented Control (FOC) with brushless DC (BLDC) motors driven by custom DRV8300-based motor drivers to achieve precise, smooth, real-time mimicry of human hand movements. Communication between the glove and hand is currently handled via ESP-NOW on ESP32 microcontrollers.
+A wearable glove with **flex sensors** at each finger joint wirelessly commands a 3D-printed robotic hand whose joints are driven by 2204 BLDC motors through custom DRV8300 drivers and **cycloidal-drive reduction gearboxes (20:1)**. ESP-NOW links the two sides at 50 Hz, end-to-end.
 
-The goal is to demonstrate that joint-level robotic hand control can be achieved affordably using consumer-grade components, providing a platform suitable for education, research prototyping, and telepresence applications.
+The motor control runs **SimpleFOC's `angle_openloop` mode** — no encoder, no current sensing in the loop. This was a deliberate trade chosen for symposium reliability after the team's encoder-based closed-loop FOC stack proved too fragile to land in time. The 20:1 cycloidal reduction absorbs any pole-pair slip into a small, sub-perceptible angular error at the joint. The trade-off is that there is no absolute position feedback, so the joints drift slowly over time and need periodic re-zeroing if they accumulate error.
 
 ## System Architecture
 
 ```
-┌─────────────────────┐     ESP-NOW      ┌──────────────────────┐
-│    Control Glove     │  ──────────────▶ │     Robotic Hand     │
-│                      │    ~50 Hz data   │                      │
-│  • MLX90395 Hall-    │                  │  • 2204 BLDC motors  │
-│    effect sensors    │                  │    (FOC control)     │
-│    (SPI, 3/finger)   │                  │  • DRV8300 custom    │
-│  • ESP32 (SPI +      │                  │    motor drivers     │
-│    ESP-NOW)          │                  │  • AS5600 encoders   │
-│  • Calibration       │                  │  • ESP32 (control)   │
-│    routines          │                  │  • 2S LiPo battery   │
-└─────────────────────┘                   └──────────────────────┘
+┌──────────────────────────┐   ESP-NOW (50 Hz)   ┌──────────────────────────────┐
+│        Control Glove      │  ────────────────▶  │        Robotic Hand          │
+│                           │   2 angles/packet   │                              │
+│  • 2 flex sensors per     │                     │  • 2204 BLDC motors          │
+│    finger (proximal +     │                     │    (SimpleFOC, open-loop     │
+│    distal joint segments) │                     │    angle control)            │
+│  • Per-channel EMA filter │                     │  • DRV8300 custom drivers    │
+│  • 2-point linear cal     │                     │  • Cycloidal drive 20:1      │
+│    (C0/C90), persisted    │                     │  • Per-joint adaptive slew   │
+│    in NVS                 │                     │  • Per-joint M0/M90 cal,     │
+│  • ESP32 DevKit v1        │                     │    persisted in NVS          │
+│                           │                     │  • ESP32 DevKit v1           │
+└──────────────────────────┘                     └──────────────────────────────┘
 ```
 
-### Data Flow
-
+### Data flow
 ```
-MLX90395 (SPI) → Angle Calculation (atan2) → ESP-NOW Packet (10 bytes)
-                                                       │
-                                                ESP-NOW broadcast
-                                                  (~50Hz, <10ms)
-                                                       │
-                                                       ▼
-                                          ESP-NOW Receive → Unpack
-                                                       │
-                                                  1 kHz FOC loop
-                                                       │
-                                                       ▼
-                                          Motor Position (AS5600)
+Flex (ADC) → 16-sample avg → EMA → 2-point cal → angle [0..90°]
+                                                      │
+                                        ESP-NOW unicast @ 50 Hz
+                                                      │
+                                                      ▼
+                              RX → EMA → adaptive velocity_limit → linear interp
+                                  (motor-frame target_rad between M0 and M90)
+                                                      │
+                                                      ▼
+                            SimpleFOC angle_openloop → rotating field
+                                                      │
+                                              20:1 cycloidal drive
+                                                      │
+                                                      ▼
+                                                 Joint motion
 ```
 
-## Key Specifications
+## Specifications
 
-| Parameter | Target | Notes |
-|-----------|--------|-------|
-| End-to-end latency | < 50 ms | Sensor-to-motor response (ESP-NOW) |
-| Position accuracy | ± 5° | Compared to goniometer reference |
-| Sensor sample rate | ≥ 50 Hz | Per-finger SPI polling |
-| ESP-NOW update rate | ≥ 50 Hz | Broadcast packets |
-| FOC control loop | ≥ 1 kHz | Timer interrupt driven |
-| Wireless range | > 2 m | Practical desktop use |
-| Continuous runtime | > 30 min | Demo duration |
-| Packet loss | < 1% | Sequence number tracking |
+| Parameter | Value | Notes |
+|---|---|---|
+| Glove → joint latency | ~20–40 ms | One ESP-NOW hop + adaptive slew |
+| Joint angle quantization | ~2.5° | Pole-pair slip / 20:1 gear ratio |
+| Joint accuracy (relative) | within slip + cal error | Drifts slowly without encoder |
+| Update rate (TX & RX) | 50 Hz | 20 ms period |
+| Joint motion ceiling | ~7.5 rad/s (~430°/s) | Adaptive vlim cap, motor-frame 250 rad/s |
+| Joint motion floor | ~1.5 rad/s (~86°/s) | Adaptive vlim floor, motor-frame 30 rad/s |
+| Continuous runtime | > 30 min | Bench supply or 2S LiPo |
+| Wireless range | > 2 m | Practical desktop |
 
 ## Project Structure
 
 ```
 wireless-glove-hand/
-├── docs/                    # Project documentation
-│   ├── proposal/            # EE198A proposal and Gantt chart
-│   ├── design/              # Architecture and ADRs
-│   ├── hardware/            # Schematics, BOM, CAD exports
-│   └── references.md        # Bibliography
-├── firmware/                # ESP32 firmware (PlatformIO)
-│   ├── glove/               # Control glove firmware
-│   │   └── src/
-│   │       ├── main.cpp     # ESP-NOW transmitter
-│   │       └── mlx90395.h   # MLX90395 SPI driver
-│   └── hand/                # Robotic hand firmware
-│       └── src/
-│           └── main.cpp     # ESP-NOW receiver + FOC
-├── hardware/                # KiCad schematics, 3D print STLs
-└── tests/                   # Test scripts and results
+├── docs/                       # Project documentation
+│   ├── proposal/               # EE198A proposal, Gantt
+│   ├── design/                 # Architecture, ADRs
+│   ├── hardware/               # Schematics, BOM, CAD
+│   └── references.md
+├── firmware/                   # PlatformIO — production firmware
+│   ├── glove/                  # 2-flex-sensor TX, NVS-persisted cal
+│   └── hand/                   # 2-motor RX, NVS-persisted cal
+├── prototyping/                # Stand-alone test sketches (historical)
+│   ├── motor-test/             # SimpleFOC closed-loop investigation
+│   ├── closed-loop-test/       # Hand-rolled 6-step commutation
+│   ├── flex-motor-test/        # Single-joint glove-to-motor pipeline
+│   ├── encoder-test/           # AS5600 read sanity check
+│   ├── sensor-test/            # MLX90395 prototype (pivoted away from)
+│   └── esp-now-test/           # Link bring-up
+├── report.md                   # Consolidated engineering report
+└── README.md
 ```
 
-## Hardware Components
+## Hardware
 
-### Control Glove
-- **MCU:** ESP32-WROOM-32 (dual-core, WiFi/ESP-NOW)
-- **Sensors:** MLX90395 Hall-effect magnetic sensors (3 per finger: MCP, PIP, DIP)
-  - **Interface:** SPI bus (SCK=18, MISO=19, MOSI=23)
-  - **Chip selects:** Configurable GPIO per sensor
-  - **Measurement:** 3-axis magnetic field → atan2 angle calculation
-  - **Backup:** Flex sensors available as fallback
-- **Power:** USB or LiPo
+### Glove (transmitter)
+- ESP32 DevKit v1
+- 2× flex sensors per finger (proximal + distal joint segments)
+- Pinout: flex inputs on GPIO 34, 35 (ADC1, input-only)
 
-### Robotic Hand
-- **MCU:** ESP32-WROOM-32
-- **Motors:** 2204 BLDC motors (one per joint) with FOC control
-  - **Pole pairs:** TBD (requires verification from motor spec)
-- **Drivers:** **DRV8300 custom PCB** designed by Raul
-  - **Components:** DRV8300 gate driver + BSZ063N04LS6 MOSFETs + ACS37042 current sensing
-  - **Cost:** ~$11.77/board (OSHPark fabrication + DigiKey components)
-  - **Features:** 3-phase BLDC control + inline current monitoring
-- **Encoders:** AS5600 magnetic rotary encoders (I2C via TCA9548A multiplexer)
-- **Structure:** 3D-printed (PLA/PETG)
-- **Power:** 2S LiPo (7.4V)
+### Hand (receiver)
+- ESP32 DevKit v1
+- 2× 2204 BLDC motors, 7 pole pairs, 12 V supply
+- 2× DRV8300 custom 6-PWM gate driver PCBs (Raul's design)
+- 2× **cycloidal-drive gearboxes, 20:1 reduction** between motor and joint
+- Pinouts:
+  - Motor 1: AH=25 AL=26 BH=27 BL=14 CH=12 CL=18
+  - Motor 2: AH=4  AL=16 BH=17 BL=19 CH=21 CL=23
+- *No encoder, no current sensing in the active control loop* — see `report.md`
 
-### Wireless Communication
-- **Current:** ESP-NOW (low-latency peer-to-peer)
-- **Note:** BLE vs ESP-NOW is under team discussion for future iterations
+### Why no encoder?
+Closed-loop FOC was extensively attempted (see `report.md` for the full investigation). The combination of an unreliable AS5600 I²C link, ambiguous pole-pair measurements, a non-deterministic SimpleFOC alignment routine, and one dead ESP32 GPIO produced FOC misalignment symptoms (motor stuck, very hot windings) that were repeatedly misdiagnosed as motor cogging. With no time to re-architect the encoder hardware before the symposium, the team adopted `angle_openloop` motor control. The cycloidal drive's 20:1 ratio makes individual pole-pair slips (~51° motor) invisible at the joint (~2.5°). The cost is slow positional drift over time; periodic re-zeroing fixes it.
 
-## Development Timeline
+## Software
 
-| Phase | Dates | Deliverables |
-|-------|-------|--------------|
-| Research & Proposal | Aug – Dec 2025 | Literature review, EE198A proposal, oral presentation |
-| Design & Component Selection | Jan – Feb 2026 | Schematic design, BOM finalization, FOC algorithm research |
-| Firmware Development | Feb – Mar 2026 | MLX90395 SPI driver, ESP-NOW communication, FOC motor control |
-| Mechanical Build & Integration | Mar – Apr 2026 | 3D-printed hand, motor mounting, DRV8300 PCB assembly, system integration |
-| Testing & Validation | Apr – May 2026 | Latency measurement, accuracy validation, endurance testing |
-| Final Report & Presentation | May 2026 | EE198B written report, oral presentation, live demo |
+- PlatformIO platform: `pioarduino/platform-espressif32@55.03.38-1` (arduino-esp32 v3.3.8 / ESP-IDF v5.5.4)
+- Library: SimpleFOC 2.4.0 (hand side)
+- Calibration persisted via the Arduino `Preferences` (ESP32 NVS) library
 
-## Getting Started
+## Bring-up
 
-### Prerequisites
-- [PlatformIO](https://platformio.org/) (recommended) or Arduino IDE
-- ESP-IDF (for advanced FOC tuning)
-- 3D printer access (for hand structure)
-
-### Building Firmware
+### Building & flashing
 
 ```bash
-# Glove firmware (ESP-NOW + MLX90395)
+# Glove (transmitter)
 cd firmware/glove
-pio run --target upload
+pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 
-# Hand firmware (ESP-NOW + SimpleFOC)
+# Hand (receiver)
 cd firmware/hand
-pio run --target upload
+pio run -t upload --upload-port /dev/cu.usbserial-YYYY
 ```
+
+The hand's MAC prints at boot. Paste it into `RECEIVER_MAC[]` at the top of `firmware/glove/src/main.cpp` once.
 
 ### Calibration
 
-**Glove:**
-1. Flash ESP32
-2. Hold hand flat → record baseline magnetic field readings (20 samples)
-3. Calibration stored in EEPROM for subsequent power cycles
+The same firmware runs in both "calibration" and "demo" modes — calibration commands are always live, and values persist in NVS so the system boots ready to use after a one-time setup.
 
-**Hand:**
-1. Flash ESP32
-2. Run motor zero-position calibration
-3. Verify encoder alignment per joint
-4. ESP-NOW pairing is automatic on boot
+**Glove**, in its serial monitor:
+1. Hold the finger flat → `C0` (captures both flex sensors as 0°)
+2. Bend the finger fully → `C90` (captures both as 90°)
+3. `S` to save to NVS
 
-## Testing
+**Hand**, with the mechanical assembly attached, in its serial monitor:
+1. `T1<deg>` to manually drive motor 1, `T2<deg>` for motor 2 — adjust until both joints are physically at "finger straight" pose
+2. `M0` (captures both motor positions as the "joint 0°" mapping)
+3. Repeat at "fully bent" → `M90`
+4. `X` to leave manual override
+5. `S` to save to NVS
 
-See `tests/` for test scripts. Key validation tests:
-- **Latency test:** High-speed camera sync between glove movement and motor response
-- **Accuracy test:** Goniometer comparison at 0°, 30°, 60°, 90° per joint
-- **Endurance test:** 30-minute continuous operation
-- **Packet loss test:** ESP-NOW sequence number tracking
+Once saved, both ESP32s boot ready to mirror the user's finger motion.
+
+## Calibration & drift management for demos
+
+- A fresh power-on reads the saved calibration; no UI interaction needed.
+- After a long run the open-loop motor commanded position can drift from the physical reality. If it visibly desyncs, send `R` on the hand then re-do the `M0`/`M90` workflow (~30 seconds), or simply power-cycle and physically re-park the mechanism.
+- The drift floor is set by the cycloidal drive's backlash + the motor's pole-pair slip on direction reversals (~2.5° per slip event, accumulates only if multiple slips happen in the same direction without correction).
 
 ## References
 
-See [`docs/references.md`](docs/references.md) for full bibliography.
+See [`docs/references.md`](docs/references.md) for full bibliography. The full engineering investigation that led to the current architecture is in [`report.md`](report.md).
 
 ## License
 
