@@ -127,6 +127,65 @@ Open-loop only needs all three phases to be switching. With the GPIO 13 → 18 w
 
 ---
 
+## 4.6 Motor driver PCB (`DRV8300_3PWM` custom board)
+
+The motor driver hardware was designed by Raul Hernandez-Solis and fabricated through OSHPark. It is the substrate on which all of the closed-loop investigation in Sections 4.1–4.5 took place, so its design choices are reflected in many of the failure modes we encountered.
+
+### 4.6.1 Bill of materials and topology
+
+| Component | Part | Role |
+|---|---|---|
+| Gate driver IC | TI **DRV8300** (3-channel half-bridge gate driver) | Translates ESP32 PWM inputs into MOSFET gate drive |
+| Power MOSFETs | **BSZ063N04LS6** (Infineon, 40 V N-channel) | 3 half-bridges (6 FETs) — phase A/B/C high + low |
+| Current sense | **ACS37042** Hall-effect linear sensor, 200 mV/A | One per phase, inline with motor lead (intent) |
+| Topology | 6-PWM (separate high-side / low-side gate inputs per phase) | Required by DRV8300 |
+| Supply | 7.4 – 19 V (motor bus voltage range tested) | Designed for 12 V bench supply, 2S LiPo compatible |
+| Form factor | 4-layer OSHPark board, ~25 × 30 mm | One per motor — 4 boards in the original BOM |
+| Unit cost | ~$11.77 | OSHPark fabrication + DigiKey components |
+
+### 4.6.2 Why this driver (vs. an off-the-shelf module)
+
+The team chose to roll a custom DRV8300 board over using commercial BLDC ESC modules for three reasons:
+
+- **Cost**: ~$11.77/board vs $25+ for commercial gimbal motor controllers (SimpleFOC Shield, ODESC, etc.).
+- **Integrated phase current sensing** (ACS37042 per phase, 200 mV/A). Closed-loop FOC with current sensing was the original control plan; this required per-phase current outputs routed to the ESP32's ADCs.
+- **Designed around our motor specs** — gate drive timing, MOSFET RDS(on), and current rating were sized for the 2204 BLDC's 2.3 Ω phase resistance and ~2 A continuous rating.
+
+### 4.6.3 Topology choice and consequence: no internal dead-time
+
+The DRV8300 is a **6-PWM gate driver**, which means each MOSFET's gate is independently controlled by the MCU (3 high-side INH, 3 low-side INL — 6 signals total). Unlike "3-PWM" drivers that internally generate complementary low-side signals with built-in dead-time between high-side OFF and low-side ON, **the DRV8300 does no dead-time insertion**. The MCU must guarantee that the high-side and low-side of the same phase are never on simultaneously.
+
+In firmware this is handled by either:
+1. Hand-rolled commutation: an explicit `delayMicroseconds(DEADTIME_US)` between turning everything off and energizing the next phase pair (used in `prototyping/closed-loop-test/`).
+2. SimpleFOC's `BLDCDriver6PWM` on the new arduino-esp32 v3.x core, which uses the ESP32 MCPWM peripheral's **hardware dead-time generator** to enforce a non-overlap window automatically (visible in the boot log as `ESP32-DRV: Configuring 6PWM with hardware dead-time`).
+
+This was identified as a relevant design constraint mid-investigation. Earlier on the arduino-esp32 v2.x core, MCPWM did not produce complementary low-side signals at all, which contributed to non-functional motor drive until the platform was upgraded.
+
+### 4.6.4 Current-sense design vs. as-built behavior
+
+The board layout placed ACS37042 Hall sensors **on each phase output trace** between the FET half-bridge and the motor connector, the intent being that all motor phase current flows through the sensor's primary path and produces a proportional voltage at the ADC pin.
+
+The diagnostic in Appendix A.1 — driving each of the six commutation phase-pairs in turn at 29 % duty (≈ 1.6 A expected steady-state) — showed sensor voltages of essentially zero (1–6 ADC LSB out of 4096, equivalent to ≤ 25 mA) on every channel. Independent confirmation came from `motor.initFOC()`'s current-sense polarity alignment step returning `CS: Err too low current, rise voltage!` across multiple boots.
+
+The most likely explanation, supported by visual inspection of the assembled boards, is that the Hall sensor IC's primary current path is not routed through the PCB the way the data sheet's typical-application reference implies — the package's pins are present but the high-current trace beneath the package does not actually pass through the sensor's flux gap. **The sensors are present on the BOM but are not functionally measuring phase current as-built.** This is the single most consequential PCB-level issue and is the reason closed-loop FOC with `TorqueControlType::foc_current` was never able to initialize successfully.
+
+### 4.6.5 Other PCB observations from bring-up
+
+- **Gate drive signals reach the FETs cleanly.** Open-loop spin verified via oscilloscope: all six gate-input pins (after the GPIO 13 → 18 wiring fix) show clean ~25 kHz PWM with hardware dead-time, and the motor produces torque appropriate to the commanded voltage. The drive stage of the PCB works.
+- **Heat dissipation is adequate at design currents.** Sustained operation at 1.3 A through the windings produced negligible board temperature rise. At the failure-mode current of ~3.9 A (35 W into the motor with FOC misaligned), the **motor** ran hot; the PCB itself stayed cool.
+- **No active cooling required.** The MOSFET choice and trace widths are appropriately sized for the 2 A continuous spec.
+- **Single per-board enable pin** ties to an ESP32 GPIO. Not currently used in firmware — both motors are always enabled when powered.
+
+### 4.6.6 Design changes recommended for a v2 board
+
+1. **Route the high-current trace through the ACS37042's flux gap.** The data sheet's "Typical Application" figure should be followed to the letter; this is the single most impactful change.
+2. **Bring out the DRV8300 fault output (`nFAULT`)** to a GPIO so the firmware can detect under-voltage, over-current, and thermal faults from the gate driver itself.
+3. **Add a shunt-resistor current-sense option** as a fallback path — high-side shunt + INA240 — for boards where the Hall layout is suspect.
+4. **Tie unused GPIOs (CL pin) to a non-strapping-pin GPIO from the BOM**, so the ESP32 dead-pin failure case (GPIO 13) doesn't require rewiring.
+5. **Decouple each phase output with TVS diodes** to reduce kickback during commutation transitions — would be required if we move from voltage-mode to true field-oriented torque control with current sense.
+
+---
+
 ## 5. The production architecture (what is being demoed)
 
 ### 5.1 Pipeline
