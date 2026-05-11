@@ -140,19 +140,96 @@ The hand's MAC prints at boot. Paste it into `RECEIVER_MAC[]` at the top of `fir
 
 The same firmware runs in both "calibration" and "demo" modes — calibration commands are always live, and values persist in NVS so the system boots ready to use after a one-time setup.
 
-**Glove**, in its serial monitor:
-1. Hold the finger flat → `C0` (captures both flex sensors as 0°)
-2. Bend the finger fully → `C90` (captures both as 90°)
-3. `S` to save to NVS
+#### Glove
 
-**Hand**, with the mechanical assembly attached, in its serial monitor:
-1. `T1<deg>` to manually drive motor 1, `T2<deg>` for motor 2 — adjust until both joints are physically at "finger straight" pose
-2. `M0` (captures both motor positions as the "joint 0°" mapping)
-3. Repeat at "fully bent" → `M90`
-4. `X` to leave manual override
-5. `S` to save to NVS
+Open the glove's serial monitor:
 
-Once saved, both ESP32s boot ready to mirror the user's finger motion.
+```bash
+cd firmware/glove
+pio device monitor --port /dev/cu.usbserial-XXXX
+```
+
+`pio device monitor` line-buffers input — type the command + Enter to send.
+
+Commands (case-insensitive):
+
+| Command | Effect |
+|---|---|
+| `C0` | Capture both flex sensors' current readings as the 0° (finger flat) endpoints |
+| `C90` | Capture both as 90° (finger fully bent) endpoints |
+| `S` | Save calibration to NVS — persists across reboots |
+| `R` | Reset calibration to defaults (run `S` after to persist) |
+| `P` | Print current calibration + live readings |
+
+Sample workflow:
+
+```text
+> P
+CAL: J0[660..180]→raw642→3°  J1[660..180]→raw645→3°
+> C0
+CAL captured: 0° → J0=642  J1=645  (run 'S' to save)
+> C90                                        # (after bending finger fully)
+CAL captured: 90° → J0=185  J1=192  (run 'S' to save)
+> S
+CAL saved to NVS
+> P                                          # verify
+CAL: J0[642..185]→raw318→63°  J1[645..192]→raw321→63°
+```
+
+To exit `pio device monitor`: `Ctrl+T` then `Ctrl+X`.
+
+#### Hand
+
+Open the hand's serial monitor (in a separate terminal):
+
+```bash
+cd firmware/hand
+pio device monitor --port /dev/cu.usbserial-YYYY
+```
+
+The hand requires the mechanical assembly (motor → cycloidal drive → joint) to be attached so the M0/M90 captures correspond to the joint's physical end-stops.
+
+Commands:
+
+| Command | Effect |
+|---|---|
+| `T1<deg>` | Manually drive **motor 1** to a target (motor-frame degrees). Disables glove tracking until `X`. Example: `T1-200`, `T1500` |
+| `T2<deg>` | Manually drive **motor 2** to a target |
+| `M0` | Capture both current motor positions as the "joint 0°" mapping |
+| `M90` | Capture both as "joint 90°" |
+| `X` | Exit manual override — both motors follow the glove again |
+| `S` | Save calibration to NVS |
+| `R` | Reset calibration to defaults |
+| `P` | Print current calibration |
+
+Sample workflow:
+
+```text
+> P
+CAL: J0  M0=0.00 rad (0°)    M90=31.42 rad (1800°)
+     J1  M0=0.00 rad (0°)    M90=31.42 rad (1800°)
+
+> T1 -100                                    # drive motor 1 backward
+Manual override J0: -100.0° (-1.745 rad)
+> T1 -50                                     # fine-tune until joint 0 looks straight
+Manual override J0: -50.0° (-0.873 rad)
+> T2 -100                                    # repeat for motor 2
+Manual override J1: -100.0° (-1.745 rad)
+> M0                                         # capture both at "straight"
+CAL captured M0: J0=-0.873  J1=-1.745 rad  (run 'S' to save)
+
+> T1 1500                                    # drive to "fully bent" position
+> T2 1500
+> M90
+CAL captured M90: J0=26.180  J1=26.180 rad  (run 'S' to save)
+
+> S
+CAL saved to NVS
+> X                                          # leave manual override; follow glove
+Manual override OFF — both joints follow glove
+```
+
+Once saved, both ESP32s boot ready to mirror the user's finger motion — no further interaction needed for the demo.
 
 ## Calibration & drift management for demos
 
